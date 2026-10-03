@@ -106,6 +106,18 @@ func (r *Receiver) findGeneration(key SourceKey, id uint64) (*generation, error)
 	return generationOf(s, id)
 }
 
+// resolveGeneration maps the current-generation sentinel (0) to the source's
+// actual generation ID so callers can name artifacts consistently.
+func (r *Receiver) resolveGeneration(key SourceKey, id uint64) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, err := r.findGeneration(key, id)
+	if err != nil {
+		return 0, err
+	}
+	return g.id, nil
+}
+
 func generationOf(s *source, id uint64) (*generation, error) {
 	if id == 0 {
 		return s.current, nil

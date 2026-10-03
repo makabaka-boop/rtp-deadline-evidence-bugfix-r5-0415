@@ -39,8 +39,8 @@ const (
 type Config struct {
 	// QueueCapacity is the hard, per-source inbound UDP packet limit.
 	QueueCapacity int
-	// ReorderWindow is the number of frames from the playout position in
-	// which an out-of-order packet is accepted.
+	// ReorderWindow is the number of frames ahead of the playout position —
+	// measured at the packet's arrival time — in which a packet is accepted.
 	ReorderWindow uint64
 }
 
@@ -365,7 +365,31 @@ func (r *Receiver) processPacket(s *source, pkt *Packet, arrival time.Time) {
 		g.invalidPackets++
 		return
 	}
-	if extendedSeq < g.nextSequence {
+	if extendedSeq < g.firstSequence {
+		// The packet predates this capture generation. It cannot belong to
+		// any output frame, so it is invalid rather than late evidence.
+		g.invalidPackets++
+		return
+	}
+	extendedTS, err := extendWrapped(g.highestTS, uint64(pkt.Timestamp), 32)
+	if err != nil {
+		g.invalidPackets++
+		return
+	}
+	if extendedTS != expectedTimestamp(g, extendedSeq) {
+		// A timestamp that disagrees with the sequence number makes the
+		// packet invalid; it must not surface as late evidence.
+		g.invalidPackets++
+		return
+	}
+
+	// Lateness is decided by the packet's actual arrival time against the
+	// frame's fixed playout deadline, never by pump timing. Arrival exactly
+	// at the deadline still plays; only a strictly later arrival is late. A
+	// frame that was already emitted is immutable either way, so a packet
+	// that reaches the receiver after emission is evidence only.
+	deadline := g.scheduledOutput(extendedSeq)
+	if arrival.After(deadline) || extendedSeq < g.nextSequence {
 		g.latePackets++
 		// It is a content duplicate only when that sequence was received
 		// before output. A frame emitted as zero-silence can still have a
@@ -377,9 +401,9 @@ func (r *Receiver) processPacket(s *source, pkt *Packet, arrival time.Time) {
 		g.late = append(g.late, LateEvidence{
 			Generation:      g.id,
 			Sequence:        extendedSeq,
-			Timestamp:       expectedTimestamp(g, extendedSeq),
+			Timestamp:       extendedTS,
 			Arrival:         arrival,
-			ScheduledOutput: g.scheduledOutput(extendedSeq),
+			ScheduledOutput: deadline,
 			Duplicate:       duplicate,
 		})
 		return
@@ -388,21 +412,11 @@ func (r *Receiver) processPacket(s *source, pkt *Packet, arrival time.Time) {
 		g.duplicatePackets++
 		return
 	}
-	if extendedSeq > g.nextSequence+s.config.ReorderWindow-1 {
-		// The packet is too far ahead to fit the explicitly bounded reorder
-		// window. It will naturally become a missing frame if playback
-		// advances before a nearer copy arrives.
-		return
-	}
-
-	extendedTS, err := extendWrapped(g.highestTS, uint64(pkt.Timestamp), 32)
-	if err != nil {
-		g.invalidPackets++
-		return
-	}
-	wantTS := g.nextTimestamp + (extendedSeq-g.nextSequence)*TimestampStep
-	if extendedTS != wantTS {
-		g.invalidPackets++
+	if extendedSeq-g.firstSequence >= g.framesDueAt(arrival)+s.config.ReorderWindow {
+		// The packet is too far ahead of the playout position at its arrival
+		// time to fit the explicitly bounded reorder window. It will
+		// naturally become a missing frame if playback advances before a
+		// nearer copy arrives.
 		return
 	}
 
@@ -431,18 +445,24 @@ func (g *generation) emitDue(now time.Time) int {
 	if !g.active || !g.started {
 		return 0
 	}
-	firstOutput := g.firstArrival.Add(StartDelay)
-	if now.Before(firstOutput) {
-		return 0
-	}
-	elapsed := now.Sub(firstOutput)
-	framesDue := uint64(elapsed/FrameDuration) + 1
+	due := g.framesDueAt(now)
 	produced := 0
-	for g.outputIndex() < framesDue {
+	for g.outputIndex() < due {
 		g.emitOne()
 		produced++
 	}
 	return produced
+}
+
+// framesDueAt returns how many frames are due at t on the fixed playout
+// schedule: zero before the first output time, then one more frame every
+// FrameDuration. A frame is due exactly at its scheduled output time.
+func (g *generation) framesDueAt(t time.Time) uint64 {
+	firstOutput := g.firstArrival.Add(StartDelay)
+	if t.Before(firstOutput) {
+		return 0
+	}
+	return uint64(t.Sub(firstOutput)/FrameDuration) + 1
 }
 
 func (g *generation) outputIndex() uint64 {
@@ -484,19 +504,38 @@ func (s *source) recordStoppedLate(pkt *Packet, arrival time.Time) {
 	if !g.started {
 		return
 	}
+	// The same validation as the live path applies: packets that predate
+	// the capture or carry inconsistent timestamps are invalid, not late
+	// evidence.
 	seq, err := extendWrapped(g.highestSeq, uint64(pkt.Sequence), 16)
 	if err != nil {
-		seq = uint64(pkt.Sequence)
+		g.invalidPackets++
+		return
+	}
+	if seq < g.firstSequence {
+		g.invalidPackets++
+		return
+	}
+	ts, err := extendWrapped(g.highestTS, uint64(pkt.Timestamp), 32)
+	if err != nil {
+		g.invalidPackets++
+		return
+	}
+	if ts != expectedTimestamp(g, seq) {
+		g.invalidPackets++
+		return
 	}
 	g.latePackets++
-	duplicate := seq < g.nextSequence
+	// As in the live path, only a sequence received before output counts
+	// as a content duplicate.
+	duplicate := g.receivedSequences[seq]
 	if duplicate {
 		g.duplicatePackets++
 	}
 	g.late = append(g.late, LateEvidence{
 		Generation:      g.id,
 		Sequence:        seq,
-		Timestamp:       expectedTimestamp(g, seq),
+		Timestamp:       ts,
 		Arrival:         arrival,
 		ScheduledOutput: g.scheduledOutput(seq),
 		Duplicate:       duplicate,

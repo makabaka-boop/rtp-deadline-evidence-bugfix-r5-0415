@@ -42,24 +42,30 @@ func WAVData(frames []OutputFrame) []byte {
 }
 
 // ExportGeneration writes one generation's WAV and JSON missing report.
-// Filenames are generated from the sanitized source and generation number.
+// Filenames are generated from the sanitized source and the resolved
+// generation number: generation 0 selects the current generation, and the
+// filenames always name the same actual generation as the report content.
 // Existing files are replaced, as requested by the caller.
 func (r *Receiver) ExportGeneration(dir string, key SourceKey, generation uint64) (wavPath, reportPath string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", err
 	}
-	frames, err := r.Frames(key, generation)
+	id, err := r.resolveGeneration(key, generation)
 	if err != nil {
 		return "", "", err
 	}
-	report, err := r.MissingReportFor(key, generation)
+	frames, err := r.Frames(key, id)
+	if err != nil {
+		return "", "", err
+	}
+	report, err := r.MissingReportFor(key, id)
 	if err != nil {
 		return "", "", err
 	}
 
 	base := sanitizeFilename(string(key))
-	wavPath = filepath.Join(dir, base+".gen"+uintToString(generation)+".wav")
-	reportPath = filepath.Join(dir, base+".gen"+uintToString(generation)+".missing.json")
+	wavPath = filepath.Join(dir, base+".gen"+uintToString(id)+".wav")
+	reportPath = filepath.Join(dir, base+".gen"+uintToString(id)+".missing.json")
 
 	if err := os.WriteFile(wavPath, WAVData(frames), 0o644); err != nil {
 		return "", "", err
