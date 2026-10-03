@@ -1,0 +1,10 @@
+
+# Local dependencies and generated outputs
+node_modules/
+dist/
+target/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.pytest_cache/
+.vite/
