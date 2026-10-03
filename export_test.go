@@ -3,6 +3,8 @@ package rtpaudio
 import (
 	"encoding/binary"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -83,5 +85,46 @@ func TestReportsAndWAVUseOutputRecords(t *testing.T) {
 		if binary.LittleEndian.Uint16(body[i:]) != 0 {
 			t.Fatalf("missing output frame had nonzero WAV byte at %d", i)
 		}
+	}
+}
+
+func TestExportGenerationZeroResolvesSnapshotOnce(t *testing.T) {
+	start := time.Date(2026, 10, 3, 18, 0, 0, 0, time.UTC)
+	clock := NewVirtualClock(start)
+	r := NewReceiver(clock, Config{QueueCapacity: 8, ReorderWindow: 8})
+	key := SourceKey("192.0.2.40:5000")
+
+	for _, data := range [][]byte{
+		makeReportTestRTP(0, 0, 1),
+		makeReportTestRTP(2, 320, 1),
+	} {
+		if status := r.HandlePacket(key, data, start); !status.Accepted {
+			t.Fatal(status.Reason)
+		}
+	}
+	clock.Advance(100 * time.Millisecond)
+	r.Pump()
+
+	dir := t.TempDir()
+	wavPath, reportPath, err := r.ExportGeneration(dir, key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Base(wavPath); got != "192.0.2.40_5000.gen1.wav" {
+		t.Fatalf("WAV name = %q", got)
+	}
+	if got := filepath.Base(reportPath); got != "192.0.2.40_5000.gen1.missing.json" {
+		t.Fatalf("report name = %q", got)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report MissingReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Generation != 1 || report.Frames != 3 || report.MissingFrames != 1 {
+		t.Fatalf("exported report = %+v", report)
 	}
 }

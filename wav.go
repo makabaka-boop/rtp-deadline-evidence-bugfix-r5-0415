@@ -42,33 +42,33 @@ func WAVData(frames []OutputFrame) []byte {
 }
 
 // ExportGeneration writes one generation's WAV and JSON missing report.
-// Filenames are generated from the sanitized source and generation number.
-// Existing files are replaced, as requested by the caller.
+// Filenames are generated from the sanitized source and the resolved
+// generation number. Generation 0 is resolved once, so both files describe the
+// same immutable snapshot. Existing files are replaced, as requested by the
+// caller.
 func (r *Receiver) ExportGeneration(dir string, key SourceKey, generation uint64) (wavPath, reportPath string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", err
 	}
-	frames, err := r.Frames(key, generation)
-	if err != nil {
-		return "", "", err
-	}
-	report, err := r.MissingReportFor(key, generation)
+	generation, frames, report, err := r.exportSnapshot(key, generation)
 	if err != nil {
 		return "", "", err
 	}
 
 	base := sanitizeFilename(string(key))
-	wavPath = filepath.Join(dir, base+".gen"+uintToString(generation)+".wav")
-	reportPath = filepath.Join(dir, base+".gen"+uintToString(generation)+".missing.json")
+	id := uintToString(generation)
+	wavPath = filepath.Join(dir, base+".gen"+id+".wav")
+	reportPath = filepath.Join(dir, base+".gen"+id+".missing.json")
 
-	if err := os.WriteFile(wavPath, WAVData(frames), 0o644); err != nil {
-		return "", "", err
-	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		return "", "", err
 	}
 	data = append(data, '\n')
+
+	if err := os.WriteFile(wavPath, WAVData(frames), 0o644); err != nil {
+		return "", "", err
+	}
 	if err := os.WriteFile(reportPath, data, 0o644); err != nil {
 		return "", "", err
 	}

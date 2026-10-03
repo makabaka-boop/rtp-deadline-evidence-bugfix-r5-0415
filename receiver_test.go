@@ -291,11 +291,190 @@ func TestStopRejectsLateDataAndRestartUsesNewGeneration(t *testing.T) {
 	if err := json.Unmarshal(rb, &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Generation != 1 || len(report.LatePackets) != 1 || report.LatePackets[0].Sequence != 4 {
+	if report.Generation != 1 || len(report.LatePackets) != 0 {
 		t.Fatalf("old generated report = %+v", report)
 	}
 	if filepath.Dir(report2) != dir {
 		t.Fatal("second report was not generated in requested directory")
+	}
+}
+
+func TestExactDeadlineIsOnTimeLaterArrivalIsLate(t *testing.T) {
+	start := time.Date(2026, 10, 3, 15, 0, 0, 0, time.UTC)
+	clock := rtpaudio.NewVirtualClock(start)
+	r := rtpaudio.NewReceiver(clock, rtpaudio.Config{QueueCapacity: 8, ReorderWindow: 8})
+	key := rtpaudio.SourceKey("192.0.2.10:5000")
+
+	submit(t, r, key, 0, 0, start)
+	if n := r.Pump(); n != 0 {
+		t.Fatalf("pump before first deadline returned %d frames, want 0", n)
+	}
+
+	clock.Advance(80 * time.Millisecond)
+	submit(t, r, key, 1, 160, clock.Now())
+	// This packet has an actual arrival after sequence 2's deadline. It must
+	// remain queued while the frame is zero-filled at 100 ms.
+	future := start.Add(101 * time.Millisecond)
+	submit(t, r, key, 2, 320, future)
+	if n := r.Pump(); n != 2 {
+		t.Fatalf("pump at exact deadline returned %d frames, want 2", n)
+	}
+	frames, _ := r.Frames(key, 0)
+	if len(frames) != 2 || frames[1].Missing {
+		t.Fatalf("sequence arriving exactly on deadline was not played: %+v", frames)
+	}
+
+	clock.Advance(20 * time.Millisecond)
+	if n := r.Pump(); n != 1 {
+		t.Fatalf("pump at missing-frame deadline returned %d frames, want 1", n)
+	}
+	frames, _ = r.Frames(key, 0)
+	if len(frames) != 3 || !frames[2].Missing {
+		t.Fatalf("future packet prevented silence: %+v", frames)
+	}
+
+	clock.Advance(1 * time.Millisecond)
+	if n := r.Pump(); n != 0 {
+		t.Fatalf("late packet caused %d new output frames", n)
+	}
+	late, err := r.LatePackets(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(late) != 1 || late[0].Sequence != 2 || late[0].Duplicate {
+		t.Fatalf("late evidence = %+v", late)
+	}
+	if !late[0].ScheduledOutput.Equal(start.Add(100*time.Millisecond)) ||
+		!late[0].Arrival.Equal(start.Add(101*time.Millisecond)) {
+		t.Fatalf("late evidence timing = %+v", late[0])
+	}
+	frames, _ = r.Frames(key, 0)
+	if !frames[2].Missing {
+		t.Fatal("late packet rewrote an emitted silent frame")
+	}
+
+	clock.Advance(1 * time.Millisecond)
+	submit(t, r, key, 2, 320, clock.Now())
+	r.Pump()
+	late, _ = r.LatePackets(key, 0)
+	if len(late) != 2 || !late[1].Duplicate {
+		t.Fatalf("second late copy evidence = %+v", late)
+	}
+}
+
+func TestIncrementalAndBulkAdvanceProduceSameOutput(t *testing.T) {
+	type event struct {
+		seq uint16
+		ts  uint32
+		at  time.Duration
+	}
+	start := time.Date(2026, 10, 3, 16, 0, 0, 0, time.UTC)
+	events := []event{
+		{0, 0, 0},
+		{2, 320, 50 * time.Millisecond},
+		{3, 480, 51 * time.Millisecond},
+		{2, 320, 52 * time.Millisecond}, // duplicate before sequence 2's deadline
+		{1, 160, 61 * time.Millisecond},
+		{0, 0, 101 * time.Millisecond}, // duplicate after sequence 0's deadline
+		{5, 800, 150 * time.Millisecond},
+	}
+	final := start.Add(160 * time.Millisecond)
+	key := rtpaudio.SourceKey("192.0.2.20:5000")
+
+	stepClock := rtpaudio.NewVirtualClock(start)
+	step := rtpaudio.NewReceiver(stepClock, rtpaudio.Config{QueueCapacity: 16, ReorderWindow: 8})
+	stepFrames := 0
+	for _, e := range events {
+		stepClock.Advance(start.Add(e.at).Sub(stepClock.Now()))
+		submit(t, step, key, e.seq, e.ts, stepClock.Now())
+		stepFrames += step.Pump()
+	}
+	stepClock.Advance(final.Sub(stepClock.Now()))
+	stepFrames += step.Pump()
+
+	bulkClock := rtpaudio.NewVirtualClock(start)
+	bulk := rtpaudio.NewReceiver(bulkClock, rtpaudio.Config{QueueCapacity: 16, ReorderWindow: 8})
+	for _, e := range events {
+		submit(t, bulk, key, e.seq, e.ts, start.Add(e.at))
+	}
+	bulkClock.Advance(160 * time.Millisecond)
+	bulkFrames := bulk.Pump()
+
+	if stepFrames != bulkFrames || bulkFrames != 6 {
+		t.Fatalf("emitted frame counts step=%d bulk=%d, want 6", stepFrames, bulkFrames)
+	}
+	sf, err := step.Frames(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bf, err := bulk.Frames(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rtpaudio.WAVData(sf)) != string(rtpaudio.WAVData(bf)) {
+		t.Fatal("incremental and bulk WAV outputs differ")
+	}
+	sr, err := step.MissingReportFor(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	br, err := bulk.MissingReportFor(key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sj, _ := json.Marshal(sr)
+	bj, _ := json.Marshal(br)
+	if string(sj) != string(bj) {
+		t.Fatalf("incremental and bulk reports differ:\n%s\n%s", sj, bj)
+	}
+	if sr.Frames != 6 || sr.MissingFrames != 1 || sr.Missing[0].Sequence != 4 || len(sr.LatePackets) != 1 {
+		t.Fatalf("unexpected report = %+v", sr)
+	}
+	if sr.LatePackets[0].Sequence != 0 || !sr.LatePackets[0].Duplicate {
+		t.Fatalf("unexpected late evidence = %+v", sr.LatePackets)
+	}
+}
+
+func TestRestartRejectsPreStartAndInvalidEvidence(t *testing.T) {
+	start := time.Date(2026, 10, 3, 17, 0, 0, 0, time.UTC)
+	clock := rtpaudio.NewVirtualClock(start)
+	r := rtpaudio.NewReceiver(clock, rtpaudio.Config{QueueCapacity: 8, ReorderWindow: 8})
+	key := rtpaudio.SourceKey("192.0.2.30:5000")
+
+	submit(t, r, key, 0, 0, start)
+	clock.Advance(80 * time.Millisecond)
+	r.Pump()
+	if _, err := r.RestartSource(key, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	old := r.HandlePacket(key, makeRTP(1, 160, testSSRC), clock.Now().Add(-time.Nanosecond))
+	if old.Reason != rtpaudio.ReasonBeforeStart {
+		t.Fatalf("pre-start packet reason = %q", old.Reason)
+	}
+	submit(t, r, key, 100, 10000, clock.Now())
+	clock.Advance(time.Nanosecond)
+	bad := r.HandlePacket(key, makeRTP(1, 999, testSSRC), clock.Now())
+	if !bad.Accepted {
+		t.Fatalf("invalid packet was rejected at enqueue: %q", bad.Reason)
+	}
+	r.Pump()
+
+	clock.Advance(60 * time.Millisecond)
+	r.Pump()
+	report, err := r.MissingReportFor(key, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Frames != 1 || report.MissingFrames != 0 || len(report.LatePackets) != 0 {
+		t.Fatalf("new generation was contaminated: %+v", report)
+	}
+	info, err := r.Info(key, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.InvalidPackets != 2 {
+		t.Fatalf("invalid packets = %d, want 2", info.InvalidPackets)
 	}
 }
 

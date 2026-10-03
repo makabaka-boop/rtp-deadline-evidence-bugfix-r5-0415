@@ -143,6 +143,22 @@ func (r *Receiver) MissingReportFor(key SourceKey, generation uint64) (MissingRe
 	return buildMissingReport(key, g), nil
 }
 
+// exportSnapshot gathers the immutable records for one export while holding the
+// receiver lock. Resolving generation 0 here ensures the WAV file name and its
+// JSON report always name the same actual generation.
+func (r *Receiver) exportSnapshot(key SourceKey, generation uint64) (uint64, []OutputFrame, MissingReport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, err := r.findGeneration(key, generation)
+	if err != nil {
+		return 0, nil, MissingReport{}, err
+	}
+	frames := make([]OutputFrame, len(g.frames))
+	copy(frames, g.frames)
+	report := buildMissingReport(key, g)
+	return g.id, frames, report, nil
+}
+
 func buildMissingReport(key SourceKey, g *generation) MissingReport {
 	missing := make([]MissingFrame, 0)
 	for _, f := range g.frames {

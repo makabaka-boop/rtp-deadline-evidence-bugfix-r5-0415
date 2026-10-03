@@ -16,4 +16,7 @@ var (
 	// ErrCounterJump indicates a sequence or timestamp jump was too large to
 	// extend unambiguously.
 	ErrCounterJump = errors.New("RTP counter discontinuity")
+	// ErrBeforeStart indicates a packet arrived before its capture generation
+	// began.
+	ErrBeforeStart = errors.New("RTP packet arrived before capture start")
 )
